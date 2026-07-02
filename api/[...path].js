@@ -13,6 +13,11 @@ module.exports = (req, res) => {
         return;
     }
 
+    // Strip /api prefix if present (Vercel routing adds it)
+    if (req.url.startsWith("/api/")) {
+        req.url = req.url.replace("/api", "");
+    }
+
     router(req, res, () => {
         res.statusCode = 404;
         res.end();

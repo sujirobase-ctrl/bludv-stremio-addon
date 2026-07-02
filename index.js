@@ -1,4 +1,4 @@
-const { addonBuilder, serveHTTP } = require("stremio-addon-sdk");
+const { addonBuilder, serveHTTP, getRouter } = require("stremio-addon-sdk");
 const fetch = require("node-fetch");
 
 const BASE_URL = "https://bludv2.xyz";
@@ -76,13 +76,35 @@ function parsePostContent(post) {
     const genreMatch = content.match(/G[êe]nero:<\/em><\/strong>\s*([^<]+)/);
     const genres = genreMatch ? genreMatch[1].trim().split(/\s*\|\s*/) : [];
 
-    // Extract magnet links
+    // Extract magnet links with their descriptions from surrounding context
     const magnetLinks = [];
-    const magnetRegex = /magnet:\?xt=urn:btih:[^"<\s]+/g;
-    let match;
-    while ((match = magnetRegex.exec(content)) !== null) {
-        let magnetUrl = match[0].replace(/&amp;/g, "&").replace(/&#038;/g, "&");
-        magnetLinks.push(magnetUrl);
+    const sections = content.split(/<center>/i);
+    let currentVersion = "";
+
+    for (let i = 0; i < sections.length; i++) {
+        const section = sections[i];
+        const cleanSection = section.replace(/<[^>]+>/g, "").replace(/&nbsp;/g, " ")
+            .replace(/&#8211;/g, "–").replace(/&amp;/g, "&").replace(/&#038;/g, "&").trim();
+
+        // Check if this is a VERSÃO header
+        if (/^VERS[ÃA]O\s/i.test(cleanSection)) {
+            currentVersion = cleanSection.split("\n")[0].trim();
+        }
+
+        // Check if this section has a SERVIDOR description
+        const servidorMatch = cleanSection.match(/SERVIDOR PARA DOWNLOAD[^\n]*/i);
+        const servidorDesc = servidorMatch ? servidorMatch[0].trim() : "";
+
+        // Check if this section has a magnet link
+        const magnetMatch = section.match(/magnet:\?xt=urn:btih:[^"<\s]+/);
+        if (magnetMatch) {
+            let magnetUrl = magnetMatch[0].replace(/&amp;/g, "&").replace(/&#038;/g, "&");
+            magnetLinks.push({
+                url: magnetUrl,
+                version: currentVersion,
+                servidor: servidorDesc,
+            });
+        }
     }
 
     // Extract quality/resolution info from title
@@ -273,21 +295,35 @@ builder.defineStreamHandler(async ({ type, id }) => {
     const streams = [];
     for (const post of posts) {
         const parsed = parsePostContent(post);
-        for (const magnetUrl of parsed.magnetLinks) {
-            const infoHashMatch = magnetUrl.match(/btih:([a-fA-F0-9]+)/);
+        for (const magnet of parsed.magnetLinks) {
+            const infoHashMatch = magnet.url.match(/btih:([a-fA-F0-9]+)/);
             const infoHash = infoHashMatch ? infoHashMatch[1].toLowerCase() : null;
 
             let streamTitle = `🇧🇷 BLUDV`;
-            if (parsed.resolution) streamTitle += ` ${parsed.resolution}`;
-            if (parsed.quality) streamTitle += ` ${parsed.quality}`;
-            if (parsed.audio) streamTitle += `\n${parsed.audio}`;
-            if (parsed.size && parsed.size !== "–") streamTitle += `\n${parsed.size}`;
+            if (magnet.servidor) {
+                streamTitle += `\n${magnet.servidor}`;
+            }
+            if (magnet.version) {
+                streamTitle += `\n${magnet.version}`;
+            }
 
             if (infoHash) {
-                streams.push({
+                // Extract tracker URLs from magnet link
+                const trackers = [];
+                const trRegex = /[&?]tr=([^&]+)/g;
+                let trMatch;
+                while ((trMatch = trRegex.exec(magnet.url)) !== null) {
+                    trackers.push("tracker:" + decodeURIComponent(trMatch[1]));
+                }
+
+                const streamObj = {
                     title: streamTitle,
                     infoHash: infoHash,
-                });
+                };
+                if (trackers.length > 0) {
+                    streamObj.sources = trackers;
+                }
+                streams.push(streamObj);
             }
         }
     }
@@ -295,7 +331,15 @@ builder.defineStreamHandler(async ({ type, id }) => {
     return { streams };
 });
 
-const PORT = process.env.PORT || 7000;
-serveHTTP(builder.getInterface(), { port: PORT });
-console.log(`BLUDV Stremio Addon running on port ${PORT}`);
-console.log(`Install URL: http://localhost:${PORT}/manifest.json`);
+// Export for Vercel serverless
+const addonInterface = builder.getInterface();
+
+if (require.main === module) {
+    // Running locally
+    const PORT = process.env.PORT || 7000;
+    serveHTTP(addonInterface, { port: PORT });
+    console.log(`BLUDV Stremio Addon running on port ${PORT}`);
+    console.log(`Install URL: http://localhost:${PORT}/manifest.json`);
+}
+
+module.exports = addonInterface;

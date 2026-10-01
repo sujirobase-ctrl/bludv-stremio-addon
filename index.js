@@ -3,6 +3,7 @@ const fetch = require("node-fetch");
 
 const BASE_URL = process.env.BLUDV_BASE_URL || "https://bludv2.xyz";
 const API_URL = `${BASE_URL}/wp-json/wp/v2/posts`;
+const CINEMETA_URL = "https://v3-cinemeta.strem.io";
 const FETCH_TIMEOUT = 10000;
 const FETCH_HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; BLUDV-Stremio-Addon/1.0; +https://www.stremio.com/)",
@@ -166,6 +167,45 @@ function parsePostContent(post) {
     };
 }
 
+function normalizeTitle(value) {
+    return (value || "")
+        .normalize("NFD")
+        .replace(/[\u0300-\u036f]/g, "")
+        .replace(/&amp;/g, "&")
+        .replace(/[^\w\s]/g, " ")
+        .replace(/\s+/g, " ")
+        .trim()
+        .toLowerCase();
+}
+
+function base32ToHex(value) {
+    const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    let bits = "";
+    let hex = "";
+
+    for (const char of value.toUpperCase().replace(/=+$/, "")) {
+        const index = alphabet.indexOf(char);
+        if (index === -1) return null;
+        bits += index.toString(2).padStart(5, "0");
+    }
+
+    for (let i = 0; i + 4 <= bits.length; i += 4) {
+        hex += parseInt(bits.slice(i, i + 4), 2).toString(16);
+    }
+
+    return hex.length === 40 ? hex : null;
+}
+
+function extractInfoHash(magnetUrl) {
+    const match = magnetUrl.match(/btih:([^&]+)/i);
+    if (!match) return null;
+
+    const hash = decodeURIComponent(match[1]).trim();
+    if (/^[a-f0-9]{40}$/i.test(hash)) return hash.toLowerCase();
+    if (/^[a-z2-7]{32}$/i.test(hash)) return base32ToHex(hash);
+    return null;
+}
+
 // Fetch with timeout
 async function fetchWithTimeout(url, timeout = FETCH_TIMEOUT) {
     const controller = new AbortController();
@@ -208,6 +248,66 @@ async function fetchPosts(options = {}) {
         console.error("Error fetching posts:", err.message);
         return [];
     }
+}
+
+async function fetchCinemetaMeta(type, imdbId) {
+    try {
+        const url = `${CINEMETA_URL}/meta/${type}/${imdbId}.json`;
+        const response = await fetchWithTimeout(url);
+        if (!response.ok) {
+            console.error(`Cinemeta returned ${response.status} for ${url}`);
+            return null;
+        }
+        const data = await response.json();
+        return data.meta || null;
+    } catch (err) {
+        console.error("Error fetching Cinemeta metadata:", err.message);
+        return null;
+    }
+}
+
+async function findPostsByTitle(type, meta) {
+    const category = type === "movie" ? CATEGORY_FILMES : CATEGORY_SERIES;
+    const titles = [
+        meta.name,
+        meta.originalName,
+        meta.imdbRating ? null : meta.releaseInfo,
+    ].filter(Boolean);
+    const seenPostIds = new Set();
+    const matches = [];
+
+    for (const title of titles) {
+        const posts = await fetchPosts({
+            search: title,
+            category,
+            perPage: 10,
+            page: 1,
+        });
+        const targetTitle = normalizeTitle(title);
+
+        for (const post of posts) {
+            if (seenPostIds.has(post.id)) continue;
+
+            const parsed = parsePostContent(post);
+            const parsedTitles = [
+                parsed.title,
+                parsed.originalTitle,
+                parsed.rawTitle,
+            ].map(normalizeTitle);
+            const titleMatches = parsedTitles.some((parsedTitle) =>
+                parsedTitle.includes(targetTitle) || targetTitle.includes(parsedTitle)
+            );
+
+            if (titleMatches || matches.length === 0) {
+                seenPostIds.add(post.id);
+                matches.push(post);
+            }
+        }
+
+        if (matches.length > 0) break;
+    }
+
+    return matches;
 }
 
 // Search for a specific IMDb ID in posts
@@ -286,9 +386,16 @@ builder.defineCatalogHandler(async ({ type, id, extra }) => {
 // Stream handler
 builder.defineStreamHandler(async ({ type, id }) => {
     let posts = [];
+    const imdbId = id.split(":")[0];
 
-    if (id.startsWith("tt")) {
-        posts = await findPostByImdbId(id);
+    if (imdbId.startsWith("tt")) {
+        posts = await findPostByImdbId(imdbId);
+        if (posts.length === 0) {
+            const meta = await fetchCinemetaMeta(type, imdbId);
+            if (meta) {
+                posts = await findPostsByTitle(type, meta);
+            }
+        }
     } else if (id.startsWith("bludv:")) {
         const postId = id.replace("bludv:", "");
         try {
@@ -311,8 +418,7 @@ builder.defineStreamHandler(async ({ type, id }) => {
     for (const post of posts) {
         const parsed = parsePostContent(post);
         for (const magnet of parsed.magnetLinks) {
-            const infoHashMatch = magnet.url.match(/btih:([a-fA-F0-9]+)/);
-            const infoHash = infoHashMatch ? infoHashMatch[1].toLowerCase() : null;
+            const infoHash = extractInfoHash(magnet.url);
 
             let streamTitle = `🇧🇷 BLUDV`;
             if (magnet.servidor) {

@@ -5,6 +5,7 @@ const BASE_URL = process.env.BLUDV_BASE_URL || "https://bludv2.xyz";
 const API_URL = `${BASE_URL}/wp-json/wp/v2/posts`;
 const WP_SEARCH_URL = `${BASE_URL}/wp-json/wp/v2/search`;
 const CINEMETA_URL = "https://v3-cinemeta.strem.io";
+const WIKIDATA_SPARQL_URL = "https://query.wikidata.org/sparql";
 const FETCH_TIMEOUT = 10000;
 const FETCH_HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; BLUDV-Stremio-Addon/1.0; +https://www.stremio.com/)",
@@ -18,6 +19,7 @@ const CATEGORY_SERIES = 10;
 // Cache IMDb ID -> post data mapping
 const imdbCache = new Map();
 const postCache = new Map();
+const titleCache = new Map();
 
 const manifest = {
     id: "community.bludv",
@@ -199,8 +201,10 @@ function getTitleQueries(meta) {
     const candidates = [
         meta.name,
         meta.originalName,
+        ...(meta.altTitles || []),
         meta.name && meta.name.replace(/^the\s+/i, ""),
         meta.originalName && meta.originalName.replace(/^the\s+/i, ""),
+        ...(meta.altTitles || []).map((title) => title.replace(/^the\s+/i, "")),
     ];
     const queries = [];
     const seen = new Set();
@@ -350,6 +354,56 @@ async function fetchCinemetaMeta(type, imdbId) {
     }
 }
 
+async function fetchAlternativeTitles(imdbId) {
+    if (titleCache.has(imdbId)) {
+        return titleCache.get(imdbId);
+    }
+
+    const query = `
+SELECT ?itemLabel ?ptLabel ?alias WHERE {
+  ?item wdt:P345 "${imdbId}".
+  OPTIONAL { ?item rdfs:label ?ptLabel FILTER(LANG(?ptLabel) IN ("pt", "pt-br")) }
+  OPTIONAL { ?item skos:altLabel ?alias FILTER(LANG(?alias) IN ("pt", "pt-br", "en")) }
+  SERVICE wikibase:label { bd:serviceParam wikibase:language "pt-br,pt,en". }
+}
+LIMIT 50`;
+    const url = `${WIKIDATA_SPARQL_URL}?format=json&query=${encodeURIComponent(query)}`;
+    const titles = new Set();
+
+    try {
+        const response = await fetchWithTimeout(url);
+        if (!response.ok) {
+            console.error(`Wikidata returned ${response.status} for IMDb ${imdbId}`);
+            titleCache.set(imdbId, []);
+            return [];
+        }
+
+        const data = await response.json();
+        for (const row of data.results.bindings) {
+            for (const field of ["itemLabel", "ptLabel", "alias"]) {
+                const title = row[field]?.value;
+                if (title && !/^Q\d+$/.test(title)) {
+                    titles.add(title);
+                }
+            }
+        }
+    } catch (err) {
+        console.error("Error fetching Wikidata titles:", err.message);
+    }
+
+    const result = [...titles];
+    titleCache.set(imdbId, result);
+    return result;
+}
+
+async function enrichMetaWithAlternativeTitles(meta, imdbId) {
+    const altTitles = await fetchAlternativeTitles(imdbId);
+    return {
+        ...meta,
+        altTitles,
+    };
+}
+
 async function fetchPostById(postId) {
     if (postCache.has(postId)) {
         return postCache.get(postId);
@@ -417,7 +471,7 @@ async function findPostsByTitle(type, meta) {
 
             seenPostIds.add(post.id);
             const score = titleScore(post, meta, queries);
-            if (score >= 45) {
+            if (score >= 45 || (score >= 30 && parsePostContent(post).magnetLinks.length > 0)) {
                 scoredMatches.push({ post, score });
             }
         }
@@ -507,7 +561,8 @@ builder.defineStreamHandler(async ({ type, id }) => {
         if (posts.length === 0) {
             const meta = await fetchCinemetaMeta(type, imdbId);
             if (meta) {
-                posts = await findPostsByTitle(type, meta);
+                const enrichedMeta = await enrichMetaWithAlternativeTitles(meta, imdbId);
+                posts = await findPostsByTitle(type, enrichedMeta);
             }
         }
     } else if (id.startsWith("bludv:")) {

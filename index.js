@@ -1,7 +1,7 @@
 const { addonBuilder, serveHTTP, getRouter } = require("stremio-addon-sdk");
 const fetch = require("node-fetch");
 
-const BASE_URL = "https://bludv2.xyz";
+const BASE_URL = process.env.BLUDV_BASE_URL || "https://bludv2.xyz";
 const API_URL = `${BASE_URL}/wp-json/wp/v2/posts`;
 const FETCH_TIMEOUT = 10000;
 const FETCH_HEADERS = {

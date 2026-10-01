@@ -7,6 +7,7 @@ module.exports = (req, res) => {
     // Add CORS headers
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Headers", "*");
+    res.setHeader("Cache-Control", "no-store, max-age=0");
 
     if (req.method === "OPTIONS") {
         res.status(200).end();

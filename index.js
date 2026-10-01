@@ -4,6 +4,10 @@ const fetch = require("node-fetch");
 const BASE_URL = "https://bludv2.xyz";
 const API_URL = `${BASE_URL}/wp-json/wp/v2/posts`;
 const FETCH_TIMEOUT = 10000;
+const FETCH_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; BLUDV-Stremio-Addon/1.0; +https://www.stremio.com/)",
+    Accept: "application/json,text/plain,*/*",
+};
 
 // Category IDs from WordPress
 const CATEGORY_FILMES = 92;
@@ -167,7 +171,10 @@ async function fetchWithTimeout(url, timeout = FETCH_TIMEOUT) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeout);
     try {
-        const response = await fetch(url, { signal: controller.signal });
+        const response = await fetch(url, {
+            headers: FETCH_HEADERS,
+            signal: controller.signal,
+        });
         clearTimeout(timer);
         return response;
     } catch (err) {
@@ -192,7 +199,10 @@ async function fetchPosts(options = {}) {
     const url = `${API_URL}?${params.toString()}`;
     try {
         const response = await fetchWithTimeout(url);
-        if (!response.ok) return [];
+        if (!response.ok) {
+            console.error(`BLUDV API returned ${response.status} for ${url}`);
+            return [];
+        }
         return await response.json();
     } catch (err) {
         console.error("Error fetching posts:", err.message);
@@ -210,6 +220,7 @@ async function findPostByImdbId(imdbId) {
             if (response.ok) {
                 return [await response.json()];
             }
+            console.error(`BLUDV API returned ${response.status} for cached post ${cachedPostId}`);
         } catch (err) {
             // Cache miss, continue to search
         }
@@ -230,6 +241,8 @@ async function findPostByImdbId(imdbId) {
                 p.content.rendered.includes(imdbId)
             );
             if (matching.length > 0) return matching;
+        } else {
+            console.error(`BLUDV API returned ${response1.status} for IMDb search ${imdbId}`);
         }
     } catch (err) {
         console.error("Error in IMDb search:", err.message);
@@ -282,6 +295,8 @@ builder.defineStreamHandler(async ({ type, id }) => {
             const response = await fetchWithTimeout(`${API_URL}/${postId}`);
             if (response.ok) {
                 posts = [await response.json()];
+            } else {
+                console.error(`BLUDV API returned ${response.status} for post ${postId}`);
             }
         } catch (err) {
             console.error("Error fetching post:", err.message);

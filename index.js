@@ -3,6 +3,7 @@ const fetch = require("node-fetch");
 
 const BASE_URL = process.env.BLUDV_BASE_URL || "https://bludv2.xyz";
 const API_URL = `${BASE_URL}/wp-json/wp/v2/posts`;
+const WP_SEARCH_URL = `${BASE_URL}/wp-json/wp/v2/search`;
 const CINEMETA_URL = "https://v3-cinemeta.strem.io";
 const FETCH_TIMEOUT = 10000;
 const FETCH_HEADERS = {
@@ -16,6 +17,7 @@ const CATEGORY_SERIES = 10;
 
 // Cache IMDb ID -> post data mapping
 const imdbCache = new Map();
+const postCache = new Map();
 
 const manifest = {
     id: "community.bludv",
@@ -49,15 +51,22 @@ const manifest = {
 
 const builder = new addonBuilder(manifest);
 
+function decodeHtml(value) {
+    return (value || "")
+        .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(parseInt(code, 10)))
+        .replace(/&#x([a-f0-9]+);/gi, (_, code) => String.fromCharCode(parseInt(code, 16)))
+        .replace(/&amp;/g, "&")
+        .replace(/&quot;/g, '"')
+        .replace(/&#039;/g, "'")
+        .replace(/&apos;/g, "'")
+        .replace(/&lt;/g, "<")
+        .replace(/&gt;/g, ">");
+}
+
 // Parse post content to extract metadata
 function parsePostContent(post) {
     const content = post.content.rendered;
-    const title = post.title.rendered
-        .replace(/&#8211;/g, "-")
-        .replace(/&amp;/g, "&")
-        .replace(/&#8217;/g, "'")
-        .replace(/&#8220;/g, '"')
-        .replace(/&#8221;/g, '"');
+    const title = decodeHtml(post.title.rendered);
 
     // Extract IMDb ID
     const imdbMatch = content.match(/imdb\.com\/(?:pt\/)?title\/(tt\d+)/);
@@ -168,14 +177,89 @@ function parsePostContent(post) {
 }
 
 function normalizeTitle(value) {
-    return (value || "")
+    return decodeHtml(value || "")
         .normalize("NFD")
         .replace(/[\u0300-\u036f]/g, "")
-        .replace(/&amp;/g, "&")
         .replace(/[^\w\s]/g, " ")
         .replace(/\s+/g, " ")
         .trim()
         .toLowerCase();
+}
+
+function cleanSearchTitle(value) {
+    return decodeHtml(value || "")
+        .replace(/\([^)]*\)/g, " ")
+        .replace(/\b(temporada|season|torrent|download|dual audio|dual áudio|dublado|legendado|web dl|webrip|bluray|blu ray|hdrip|hdtv|remux|proper|complete|completa)\b/gi, " ")
+        .replace(/\b(720p|1080p|2160p|4k|3d|x264|x265|hevc|10bit)\b/gi, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
+function getTitleQueries(meta) {
+    const candidates = [
+        meta.name,
+        meta.originalName,
+        meta.name && meta.name.replace(/^the\s+/i, ""),
+        meta.originalName && meta.originalName.replace(/^the\s+/i, ""),
+    ];
+    const queries = [];
+    const seen = new Set();
+
+    for (const candidate of candidates) {
+        const cleaned = cleanSearchTitle(candidate);
+        if (!cleaned) continue;
+
+        const variants = [
+            cleaned,
+            cleaned.split(":")[0].trim(),
+            cleaned.split("-")[0].trim(),
+        ];
+
+        for (const variant of variants) {
+            const key = normalizeTitle(variant);
+            if (key.length >= 3 && !seen.has(key)) {
+                seen.add(key);
+                queries.push(variant);
+            }
+        }
+    }
+
+    return queries;
+}
+
+function titleScore(post, meta, queries) {
+    const parsed = parsePostContent(post);
+    const postTitles = [
+        parsed.title,
+        parsed.originalTitle,
+        parsed.rawTitle,
+    ].map(normalizeTitle).filter(Boolean);
+    const queryTitles = queries.map(normalizeTitle).filter(Boolean);
+    const releaseYear = String(meta.year || meta.releaseInfo || "").match(/\d{4}/)?.[0];
+    let score = 0;
+
+    for (const query of queryTitles) {
+        const queryWords = query.split(" ").filter((word) => word.length > 2);
+        for (const postTitle of postTitles) {
+            if (postTitle === query) score = Math.max(score, 100);
+            if (postTitle.includes(query) || query.includes(postTitle)) score = Math.max(score, 80);
+
+            const matchedWords = queryWords.filter((word) => postTitle.includes(word)).length;
+            if (queryWords.length > 0) {
+                score = Math.max(score, Math.round((matchedWords / queryWords.length) * 60));
+            }
+        }
+    }
+
+    if (releaseYear && parsed.year === parseInt(releaseYear, 10)) {
+        score += 20;
+    }
+
+    if (parsed.magnetLinks.length > 0) {
+        score += 10;
+    }
+
+    return score;
 }
 
 function base32ToHex(value) {
@@ -266,48 +350,83 @@ async function fetchCinemetaMeta(type, imdbId) {
     }
 }
 
+async function fetchPostById(postId) {
+    if (postCache.has(postId)) {
+        return postCache.get(postId);
+    }
+
+    try {
+        const response = await fetchWithTimeout(`${API_URL}/${postId}`);
+        if (!response.ok) {
+            console.error(`BLUDV API returned ${response.status} for post ${postId}`);
+            return null;
+        }
+        const post = await response.json();
+        postCache.set(postId, post);
+        return post;
+    } catch (err) {
+        console.error("Error fetching post:", err.message);
+        return null;
+    }
+}
+
+async function fetchWpSearchPosts(search) {
+    const params = new URLSearchParams();
+    params.set("search", search);
+    params.set("per_page", 20);
+    params.set("subtype", "post");
+
+    const url = `${WP_SEARCH_URL}?${params.toString()}`;
+    try {
+        const response = await fetchWithTimeout(url);
+        if (!response.ok) {
+            console.error(`BLUDV search API returned ${response.status} for ${url}`);
+            return [];
+        }
+
+        const results = await response.json();
+        const posts = [];
+        for (const result of results) {
+            const post = await fetchPostById(result.id);
+            if (post) posts.push(post);
+        }
+        return posts;
+    } catch (err) {
+        console.error("Error searching BLUDV posts:", err.message);
+        return [];
+    }
+}
+
 async function findPostsByTitle(type, meta) {
     const category = type === "movie" ? CATEGORY_FILMES : CATEGORY_SERIES;
-    const titles = [
-        meta.name,
-        meta.originalName,
-        meta.imdbRating ? null : meta.releaseInfo,
-    ].filter(Boolean);
+    const queries = getTitleQueries(meta);
     const seenPostIds = new Set();
-    const matches = [];
+    const scoredMatches = [];
 
-    for (const title of titles) {
-        const posts = await fetchPosts({
-            search: title,
-            category,
-            perPage: 10,
-            page: 1,
-        });
-        const targetTitle = normalizeTitle(title);
+    for (const query of queries) {
+        const searchBatches = [
+            fetchPosts({ search: query, category, perPage: 20, page: 1 }),
+            fetchPosts({ search: query, perPage: 20, page: 1 }),
+            fetchWpSearchPosts(query),
+        ];
+        const batches = await Promise.all(searchBatches);
+        const posts = batches.flat();
 
         for (const post of posts) {
             if (seenPostIds.has(post.id)) continue;
 
-            const parsed = parsePostContent(post);
-            const parsedTitles = [
-                parsed.title,
-                parsed.originalTitle,
-                parsed.rawTitle,
-            ].map(normalizeTitle);
-            const titleMatches = parsedTitles.some((parsedTitle) =>
-                parsedTitle.includes(targetTitle) || targetTitle.includes(parsedTitle)
-            );
-
-            if (titleMatches || matches.length === 0) {
-                seenPostIds.add(post.id);
-                matches.push(post);
+            seenPostIds.add(post.id);
+            const score = titleScore(post, meta, queries);
+            if (score >= 45) {
+                scoredMatches.push({ post, score });
             }
         }
-
-        if (matches.length > 0) break;
     }
 
-    return matches;
+    return scoredMatches
+        .sort((a, b) => b.score - a.score)
+        .slice(0, 5)
+        .map((match) => match.post);
 }
 
 // Search for a specific IMDb ID in posts
@@ -315,14 +434,9 @@ async function findPostByImdbId(imdbId) {
     // Check cache first
     if (imdbCache.has(imdbId)) {
         const cachedPostId = imdbCache.get(imdbId);
-        try {
-            const response = await fetchWithTimeout(`${API_URL}/${cachedPostId}`);
-            if (response.ok) {
-                return [await response.json()];
-            }
-            console.error(`BLUDV API returned ${response.status} for cached post ${cachedPostId}`);
-        } catch (err) {
-            // Cache miss, continue to search
+        const cachedPost = await fetchPostById(cachedPostId);
+        if (cachedPost) {
+            return [cachedPost];
         }
     }
 
@@ -398,15 +512,9 @@ builder.defineStreamHandler(async ({ type, id }) => {
         }
     } else if (id.startsWith("bludv:")) {
         const postId = id.replace("bludv:", "");
-        try {
-            const response = await fetchWithTimeout(`${API_URL}/${postId}`);
-            if (response.ok) {
-                posts = [await response.json()];
-            } else {
-                console.error(`BLUDV API returned ${response.status} for post ${postId}`);
-            }
-        } catch (err) {
-            console.error("Error fetching post:", err.message);
+        const post = await fetchPostById(postId);
+        if (post) {
+            posts = [post];
         }
     }
 
